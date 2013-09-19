@@ -1,7 +1,7 @@
-# HowTo Setup Openstack Compute Node (Grizzly)
+# HowTo Setup Openstack (Grizzly) XenServer Compute Node
 
 
-This tutorial attempts to describes how to setup an Openstack (Grizzly) Compute Node using Xenserver 6.2.0. 
+This tutorial attempts to describes how to setup an Openstack (Grizzly) Compute Node using **XenServer 6.2.0**. 
 
 **Disclaimer:** These are the notes I took during my month long `Hacking Openstack` venture trying to get it functioning (which I manged to do). I do not claim to be an expert on Openstack therefore I  take no responsibility for any hardware or software damages that may occur to your system. I recommend that you perform this tutorial in a sandbox environment.
 
