@@ -68,13 +68,13 @@ The following set of instructions assumes that the server:
 ### Install Openstack Plugins
 
 1. Press **alt+F3**, which should bring you to the terminal console, then **login as root**
-2. Download the plugins package from the **quantum-agent** folder in this repo and install the package *(a little **wget** magic should do the trick)*
+2. Download the plugins package from the **quantum-agent** folder in this repo and install the package *(a little __wget__ magic should do the trick)*
     * $ rpm -i openstack-quantum-xen-plugins.noarch.rpm
 
 
 ### Create an ISO Storage Repository (Optional)
 
-***Note:** Remember to replace UUID (12345678-1234-5678-1234-567812345678) with the actual ID*
+*__Note:__ Remember to replace UUID (12345678-1234-5678-1234-567812345678) with the actual ID*
 
 1. $ cd /var/run/sr-mount/12345678-1234-5678-1234-567812345678 && mkdir iso
 2. $ sr_uuid=$(xe sr-create name-label=LocalISO type=iso device-config:location=/var/run/sr-mount/12345678-1234-5678-1234-567812345678/iso device-config:legacy_mode=true content-type=iso)
@@ -83,7 +83,7 @@ The following set of instructions assumes that the server:
 
 ### Create Openstack Tenant Network
 
-*The following set of instructions require **XenCenter***
+*The following set of instructions require __XenCenter__*
 
 1. Open **XenCenter** and connect this server
 2. Next, select the Networking tab
@@ -114,7 +114,7 @@ The following set of instructions assumes that the server:
 
 ## Openstack VM Installation
 
-*The following set of instructions assumes that you’ve already created a VM instance with Ubuntu Server installed and that you’ve setup the network interfaces **(Network-0 and Network-1)** to be attached to this VM. Also the instructions require you to be running in privilege mode, either as **root** or executing **sudo** before the command*
+*The following set of instructions assumes that you’ve already created a VM instance with Ubuntu Server installed and that you’ve setup the network interfaces __(Network-0 and Network-1)__ to be attached to this VM. Also the instructions require you to be running in privilege mode, either as __root__ or executing __sudo__ before the command*
 
 1. Login to your Ubuntu instance and execute the following:
     * $ apt-get update -y
@@ -162,9 +162,9 @@ The following set of instructions assumes that the server:
 3. Configure the quantum plugin:
     1. $ cd /etc/quantum/plugins/openvswitch/
     2. $ scp root@10.10.7.1:/etc/quantum/plugins/openvswitch/ovs_quantum_plugin.ini . # Replace the IP with your Controller’s IP
-    3. edit ovs_**quantum_plugin.ini**:
+    3. edit **ovs\_quantum\_plugin.ini**:
         * tenant\_network\_type = vlan
-        * network\_vlan\_ranges = physnet2:100:2999
+        * network\_vlan\_ranges = physnet2:100 :2999
         * integration_bridge = xapi0 # This represents the bridge associated with the tenant network created earlier
         * bridge_mappings = physnet2:xenbr2 # The bridge used for VM traffic (It will be the bridge associated with the 3rd NIC)
     4. $ cd /etc/quantum/
@@ -233,13 +233,13 @@ The following set of instructions assumes that the server:
 
 ### XenServer Tools Installation
 
-1. Open XenCenter and select the the VM running OpenStack *(I named the vm **OpenStack-VM**)*
+1. Open XenCenter and select the the VM running OpenStack *(I named the vm __OpenStack-VM__)*
 2. Select the **Console** tab and then select xs-tools.iso from the drop down list labeled DVD Drive
 3. Login into the VM from the console and issue the following commands:
     * $ mkdir /mnt/xs-tools
     * $ mount /dev/xvdd /mnt/xs-tools
     * $ cd /mnt/xs-tools/Linux/
-    * $ bash install.sh *(If you get an error run **dpkg -i xe-guest-utilities_6.2.0-1120_amd64.deb**)*
+    * $ bash install.sh *(If you get an error run __dpkg -i xe-guest-utilities_6.2.0-1120_amd64.deb__)*
     * $ reboot
  
 ## Questions?
