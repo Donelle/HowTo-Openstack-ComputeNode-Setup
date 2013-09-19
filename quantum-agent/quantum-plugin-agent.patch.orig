@@ -1,0 +1,691 @@
+From 7ff0c53564f46bdd6f47cb1ed9e6d2460d088b1e Mon Sep 17 00:00:00 2001
+From: Maru Newby <mnewby@internap.com>
+Date: Thu, 25 Oct 2012 18:03:26 +0000
+Subject: [PATCH] Add support for OVS l2 agent in XS/XCP domU.
+
+ * Config doc: http://wiki.openstack.org/QuantumDevstackOvsXcp
+
+ * The Open vSwitch agent needs to be deployed on domU but
+   interact with a dom0 bridge.
+ * Add a root wrapper and associated XenAPI plugin to allow the
+   agent to execute networking commands against dom0 from domU.
+ * Update ovs_lib mac address discovery to use ip_lib to
+   ensure that discovery works even for bridges not local to
+   the agent (i.e. dom0 bridges).  A bridge configured with
+   a dom0 root wrapper will execute ip link on dom0.
+ * Update ip_lib to use a root helper by default to ensure that
+   the 'ip' command will execute on dom0.
+ * Remove obselete rpm spec and installer for dom0 agent.
+ * Credit where credit is due - the XenAPI plugin and its
+   packaging were largely copied from nova.
+ * Supports blueprint xenapi-ovs
+
+Change-Id: I7795446ee1267712c896f5cb3401f84fb1763ce7
+---
+ bin/quantum-rootwrap-xen-dom0                      | 119 +++++++++++++++++++++
+ etc/rootwrap.conf                                  |   7 ++
+ quantum/agent/linux/ip_lib.py                      |  18 ++++
+ quantum/agent/linux/ovs_lib.py                     |  10 ++
+ quantum/plugins/openvswitch/Makefile               |  54 ----------
+ .../agent/ovs-quantum-agent-xs_xcp.spec            |  33 ------
+ .../plugins/openvswitch/agent/ovs_quantum_agent.py |  14 ++-
+ quantum/plugins/openvswitch/agent/xenapi/README    |  16 +++
+ .../openvswitch/agent/xenapi/contrib/build-rpm.sh  |  34 ++++++
+ .../SPECS/openstack-quantum-xen-plugins.spec       |  30 ++++++
+ .../agent/xenapi/etc/xapi.d/plugins/netwrap        |  73 +++++++++++++
+ .../plugins/openvswitch/agent/xenserver_install.sh |  40 -------
+ quantum/tests/unit/openvswitch/test_ovs_lib.py     |  13 +++
+ quantum/tests/unit/openvswitch/test_ovs_tunnel.py  |   5 +-
+ 14 files changed, 331 insertions(+), 135 deletions(-)
+ create mode 100755 bin/quantum-rootwrap-xen-dom0
+ delete mode 100644 quantum/plugins/openvswitch/Makefile
+ delete mode 100644 quantum/plugins/openvswitch/agent/ovs-quantum-agent-xs_xcp.spec
+ create mode 100644 quantum/plugins/openvswitch/agent/xenapi/README
+ create mode 100755 quantum/plugins/openvswitch/agent/xenapi/contrib/build-rpm.sh
+ create mode 100644 quantum/plugins/openvswitch/agent/xenapi/contrib/rpmbuild/SPECS/openstack-quantum-xen-plugins.spec
+ create mode 100644 quantum/plugins/openvswitch/agent/xenapi/etc/xapi.d/plugins/netwrap
+ delete mode 100755 quantum/plugins/openvswitch/agent/xenserver_install.sh
+
+diff --git a/bin/quantum-rootwrap-xen-dom0 b/bin/quantum-rootwrap-xen-dom0
+new file mode 100755
+index 0000000..f4e6d2f
+--- /dev/null
++++ b/bin/quantum-rootwrap-xen-dom0
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python
++
++# Copyright (c) 2012 Openstack, LLC.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Quantum root wrapper for dom0.
++
++Executes networking commands in dom0.  The XenAPI plugin is
++responsible determining whether a command is safe to execute.
++
++"""
++
++import ConfigParser
++import json
++import os
++import sys
++import traceback
++
++import XenAPI
++
++
++RC_UNAUTHORIZED = 99
++RC_NOCOMMAND = 98
++RC_BADCONFIG = 97
++RC_XENAPI_ERROR = 96
++
++
++def parse_args():
++    # Split arguments, require at least a command
++    exec_name = sys.argv.pop(0)
++    # argv[0] required; path to conf file
++    if len(sys.argv) < 2:
++        print "%s: No command specified" % exec_name
++        sys.exit(RC_NOCOMMAND)
++
++    config_file = sys.argv.pop(0)
++    user_args = sys.argv[:]
++
++    return exec_name, config_file, user_args
++
++
++def load_configuration(exec_name, config_file):
++    config = ConfigParser.RawConfigParser()
++    config.read(config_file)
++    try:
++        filters_path = config.get("DEFAULT", "filters_path").split(",")
++        section = 'XENAPI'
++        url = config.get(section, "xenapi_connection_url")
++        username = config.get(section, "xenapi_connection_username")
++        password = config.get(section, "xenapi_connection_password")
++    except ConfigParser.Error:
++        print "%s: Incorrect configuration file: %s" % (exec_name, config_file)
++        sys.exit(RC_BADCONFIG)
++    if not url or not password:
++        msg = ("%s: Must specify xenapi_connection_url, "
++               "xenapi_connection_username (optionally), and "
++               "xenapi_connection_password in %s") % (exec_name, config_file)
++        print msg
++        sys.exit(RC_BADCONFIG)
++    return dict(
++        filters_path=filters_path,
++        url=url,
++        username=username,
++        password=password,
++    )
++
++
++def filter_command(exec_name, filters_path, user_args):
++    # Add ../ to sys.path to allow running from branch
++    possible_topdir = os.path.normpath(os.path.join(os.path.abspath(exec_name),
++                                                    os.pardir, os.pardir))
++    if os.path.exists(os.path.join(possible_topdir, "quantum", "__init__.py")):
++        sys.path.insert(0, possible_topdir)
++
++    from quantum.rootwrap import wrapper
++
++    # Execute command if it matches any of the loaded filters
++    filters = wrapper.load_filters(filters_path)
++    filter_match = wrapper.match_filter(filters, user_args)
++    if not filter_match:
++        print "Unauthorized command: %s" % ' '.join(user_args)
++        sys.exit(RC_UNAUTHORIZED)
++
++
++def run_command(url, username, password, user_args):
++    try:
++        session = XenAPI.Session(url)
++        session.login_with_password(username, password)
++        host = session.xenapi.session.get_this_host(session.handle)
++        result = session.xenapi.host.call_plugin(
++            host, 'netwrap', 'run_command', {'cmd': json.dumps(user_args)})
++        return json.loads(result)
++    except Exception as e:
++        traceback.print_exc()
++        sys.exit(RC_XENAPI_ERROR)
++
++
++def main():
++    exec_name, config_file, user_args = parse_args()
++    config = load_configuration(exec_name, config_file)
++    filter_command(exec_name, config['filters_path'], user_args)
++    return run_command(config['url'], config['username'], config['password'],
++                       user_args)
++
++
++if __name__ == '__main__':
++    print main()
+diff --git a/etc/rootwrap.conf b/etc/rootwrap.conf
+index 5f88a6a..cd472f5 100644
+--- a/etc/rootwrap.conf
++++ b/etc/rootwrap.conf
+@@ -2,3 +2,10 @@
+ # List of directories to load filter definitions from (separated by ',').
+ # These directories MUST all be only writeable by root !
+ filters_path=/etc/quantum/rootwrap.d,/usr/share/quantum/rootwrap
++
++[XENAPI]
++# XenAPI configuration is only required by the L2 agent if it is to
++# target a XenServer/XCP compute host's dom0.
++xenapi_connection_url=<None>
++xenapi_connection_username=root
++xenapi_connection_password=<None>
+diff --git a/quantum/agent/linux/ip_lib.py b/quantum/agent/linux/ip_lib.py
+index 0aba924..9de7df9 100644
+--- a/quantum/agent/linux/ip_lib.py
++++ b/quantum/agent/linux/ip_lib.py
+@@ -15,11 +15,19 @@
+ #    under the License.
+ 
+ import netaddr
++from oslo.config import cfg
+ 
+ from quantum.agent.linux import utils
+ from quantum.common import exceptions
+ 
+ 
++OPTS = [
++    cfg.BoolOpt('ip_lib_force_root',
++                default=False,
++                help=_('Force ip_lib calls to use the root helper')),
++]
++
++
+ LOOPBACK_DEVNAME = 'lo'
+ 
+ 
+@@ -27,10 +35,20 @@ class SubProcessBase(object):
+     def __init__(self, root_helper=None, namespace=None):
+         self.root_helper = root_helper
+         self.namespace = namespace
++        try:
++            self.force_root = cfg.CONF.ip_lib_force_root
++        except cfg.NoSuchOptError:
++            # Only callers that need to force use of the root helper
++            # need to register the option.
++            self.force_root = False
+ 
+     def _run(self, options, command, args):
+         if self.namespace:
+             return self._as_root(options, command, args)
++        elif self.force_root:
++            # Force use of the root helper to ensure that commands
++            # will execute in dom0 when running under XenServer/XCP.
++            return self._execute(options, command, args, self.root_helper)
+         else:
+             return self._execute(options, command, args)
+ 
+diff --git a/quantum/agent/linux/ovs_lib.py b/quantum/agent/linux/ovs_lib.py
+index f435a34..5e8cb94 100644
+--- a/quantum/agent/linux/ovs_lib.py
++++ b/quantum/agent/linux/ovs_lib.py
+@@ -20,6 +20,7 @@
+ 
+ import re
+ 
++from quantum.agent.linux import ip_lib
+ from quantum.agent.linux import utils
+ from quantum.openstack.common import log as logging
+ 
+@@ -283,6 +284,15 @@ class OVSBridge:
+         for port_name in port_names:
+             self.delete_port(port_name)
+ 
++    def get_local_port_mac(self):
++        """Retrieve the mac of the bridge's local port."""
++        address = ip_lib.IPDevice(self.br_name, self.root_helper).link.address
++        if address:
++            return address
++        else:
++            msg = _('Unable to determine mac address for %s') % self.br_name
++            raise Exception(msg)
++
+ 
+ def get_bridge_for_iface(root_helper, iface):
+     args = ["ovs-vsctl", "--timeout=2", "iface-to-br", iface]
+diff --git a/quantum/plugins/openvswitch/Makefile b/quantum/plugins/openvswitch/Makefile
+deleted file mode 100644
+index b668cfd..0000000
+--- a/quantum/plugins/openvswitch/Makefile
++++ /dev/null
+@@ -1,54 +0,0 @@
+-# TODO(bgh): DIST_DIR and target for plugin
+-PHONY: help
+-
+-AGENT_DIST_DIR=ovs_quantum_agent
+-AGENT_DIST_TARBALL=ovs_quantum_agent.tgz
+-VERSION=$(shell python -c "import sys ; sys.path.append('../../../quantum/') ; import version ; print version.canonical_version_string()")
+-XAPI_PLUGINS_DIR=$(AGENT_DIST_DIR)/build/ovs-quantum-agent-$(VERSION)/etc/xapi.d/plugins
+-RPM_BUILD_ROOT=$(AGENT_DIST_DIR)/build/rpm
+-
+-help:
+-	@echo "make agent-dist-xen - to create the ovs-quantum-agent-${VERSION}-1.noarch.rpm"
+-	@echo "make agent-dist-xen-python26 - to create ovs-quantum-agent-${VERSION}-1.noarch.rpm and use python2.6"
+-
+-agent-dist-xen:QUANTUM_LIBS=$(AGENT_DIST_DIR)/build/ovs-quantum-agent-$(VERSION)/usr/lib/python2.4/site-packages
+-agent-dist-xen-python26:QUANTUM_LIBS=$(AGENT_DIST_DIR)/build/ovs-quantum-agent-$(VERSION)/usr/lib/python2.6/site-packages
+-
+-agent-dist-xen agent-dist-xen-python26: distclean
+-	yum --enablerepo=base install rpm-build
+-	mkdir -p $(XAPI_PLUGINS_DIR)
+-	mkdir -p $(QUANTUM_LIBS)/{quantum/plugins/openvswitch/common,quantum/openstack/common}
+-	mkdir -p $(QUANTUM_LIBS)/quantum/agent/linux
+-	mkdir -p $(RPM_BUILD_ROOT)/BUILD $(RPM_BUILD_ROOT)/SOURCES
+-	mkdir -p $(RPM_BUILD_ROOT)/SRPMS $(RPM_BUILD_ROOT)/RPMS $(RPM_BUILD_ROOT)/SPECS
+-	cp agent/*.py $(XAPI_PLUGINS_DIR)
+-	cp agent/*.sh $(AGENT_DIST_DIR)
+-	cp agent/ovs-quantum-agent-xs_xcp.spec $(AGENT_DIST_DIR)
+-	sed -i "s/VERSION/$(VERSION)/" $(AGENT_DIST_DIR)/ovs-quantum-agent-xs_xcp.spec
+-	cp README $(AGENT_DIST_DIR)
+-	cp ../../../etc/quantum/plugins/openvswitch/ovs_quantum_plugin.ini $(XAPI_PLUGINS_DIR)
+-	cp ../../agent/linux/{ovs_lib.py,utils.py,__init__.py} $(QUANTUM_LIBS)/quantum/agent/linux
+-	test -d $(AGENT_DIST_DIR)/build/ovs-quantum-agent-$(VERSION)/usr/lib/python2.6/site-packages && \
+-		sed -i 's/Requires:.*/Requires:	   python26 python26-sqlalchemy python26-mysqldb/' \
+-			 $(AGENT_DIST_DIR)/ovs-quantum-agent-xs_xcp.spec || true
+-	test -d $(AGENT_DIST_DIR)/build/ovs-quantum-agent-$(VERSION)/usr/lib/python2.6/site-packages && \
+-		sed -i 's/env python/env python2.6/' $(XAPI_PLUGINS_DIR)/ovs_quantum_agent.py || true
+-	cp ../../__init__.py $(QUANTUM_LIBS)/quantum/
+-	cp ../../agent/__init__.py $(QUANTUM_LIBS)/quantum/agent/
+-	cp ../__init__.py $(QUANTUM_LIBS)/quantum/plugins/
+-	cp __init__.py $(QUANTUM_LIBS)/quantum/plugins/openvswitch/
+-	cp common/{config.py,__init__.py} $(QUANTUM_LIBS)/quantum/plugins/openvswitch/common/
+-	cp ../../openstack/__init__.py $(QUANTUM_LIBS)/quantum/openstack/
+-	tar -czvpf ${RPM_BUILD_ROOT}/SOURCES/ovs-quantum-agent-${VERSION}.tgz -C $(AGENT_DIST_DIR)/build ovs-quantum-agent-${VERSION}
+-	rpmbuild -ba --define "_topdir $(shell pwd)/$(RPM_BUILD_ROOT)" --clean $(AGENT_DIST_DIR)/ovs-quantum-agent-xs_xcp.spec
+-	@echo "Agent package created: ovs_quantum_agent/build/rpm/RPMS/noarch/ovs-quantum-agent-${VERSION}-1.noarch.rpm"
+-	@echo "See README for installation details"
+-
+-all:
+-
+-clean:
+-	$(find . -name *.pyc | xargs rm)
+-
+-distclean:
+-	-rm -rf $(AGENT_DIST_DIR)
+-	-rm -f $(AGENT_DIST_TARBALL)
+diff --git a/quantum/plugins/openvswitch/agent/ovs-quantum-agent-xs_xcp.spec b/quantum/plugins/openvswitch/agent/ovs-quantum-agent-xs_xcp.spec
+deleted file mode 100644
+index 707e110..0000000
+--- a/quantum/plugins/openvswitch/agent/ovs-quantum-agent-xs_xcp.spec
++++ /dev/null
+@@ -1,33 +0,0 @@
+-Name:           ovs-quantum-agent
+-Version:        VERSION
+-Release:        1
+-License:        Apache2
+-Group:          System Environment/Base
+-Summary:        Ovs Quantum Agent
+-Source:         %{name}-%{version}.tgz
+-BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root
+-BuildArch:      noarch
+-Requires:       python python-sqlalchemy
+-
+-%description
+-OVS Quantum Agent
+-
+-%prep
+-%setup
+-
+-%install
+-rm -rf --preserve-root %{buildroot}
+-install -d -m 755 %{buildroot}
+-cp -af * %{buildroot}
+-pushd %{buildroot}
+-find ./usr ./etc -type f -o -type l | sed "s/\.//" > %{_builddir}/%{name}-%{version}/%{name}-%{version}-%{release}-filelist
+-popd
+-
+-%clean
+-[ %{buildroot} != / ] && rm -rf %{buildroot}
+-
+-%files -f %{_builddir}/%{name}-%{version}/%{name}-%{version}-%{release}-filelist
+-
+-%changelog
+-* Thu Jun 14 2012 Juliano Martinez <juliano.martinez@locaweb.com.br> - VERSION
+-- Creating quantum ovs agent package
+diff --git a/quantum/plugins/openvswitch/agent/ovs_quantum_agent.py b/quantum/plugins/openvswitch/agent/ovs_quantum_agent.py
+index 91dcda1..fca62a1 100644
+--- a/quantum/plugins/openvswitch/agent/ovs_quantum_agent.py
++++ b/quantum/plugins/openvswitch/agent/ovs_quantum_agent.py
+@@ -28,7 +28,6 @@ from oslo.config import cfg
+ 
+ from quantum.agent.linux import ip_lib
+ from quantum.agent.linux import ovs_lib
+-from quantum.agent.linux import utils
+ from quantum.agent import rpc as agent_rpc
+ from quantum.agent import securitygroups_rpc as sg_rpc
+ from quantum.common import config as logging_config
+@@ -185,7 +184,7 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
+             'configurations': bridge_mappings,
+             'agent_type': q_const.AGENT_TYPE_OVS,
+             'start_flag': True}
+-        self.setup_rpc(integ_br)
++        self.setup_rpc()
+ 
+         # Security group agent supprot
+         self.sg_agent = OVSSecurityGroupAgent(self.context,
+@@ -204,8 +203,8 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
+         except Exception:
+             LOG.exception(_("Failed reporting state!"))
+ 
+-    def setup_rpc(self, integ_br):
+-        mac = utils.get_interface_mac(integ_br)
++    def setup_rpc(self):
++        mac = self.int_br.get_local_port_mac()
+         self.agent_id = '%s%s' % ('ovs', (mac.replace(":", "")))
+         self.topic = topics.AGENT
+         self.plugin_rpc = OVSPluginApi(topics.PLUGIN)
+@@ -762,6 +761,7 @@ def create_agent_config_map(config):
+ def main():
+     eventlet.monkey_patch()
+     cfg.CONF(project='quantum')
++    cfg.CONF.register_opts(ip_lib.OPTS)
+     logging_config.setup_logging(cfg.CONF)
+ 
+     try:
+@@ -770,6 +770,12 @@ def main():
+         LOG.error(_('%s Agent terminated!'), e)
+         sys.exit(1)
+ 
++    is_xen_compute_host = 'rootwrap-xen-dom0' in agent_config['root_helper']
++    if is_xen_compute_host:
++        # Force ip_lib to always use the root helper to ensure that ip
++        # commands target xen dom0 rather than domU.
++        cfg.CONF.set_default('ip_lib_force_root', True)
++
+     plugin = OVSQuantumAgent(**agent_config)
+ 
+     # Start everything.
+diff --git a/quantum/plugins/openvswitch/agent/xenapi/README b/quantum/plugins/openvswitch/agent/xenapi/README
+new file mode 100644
+index 0000000..321a7fc
+--- /dev/null
++++ b/quantum/plugins/openvswitch/agent/xenapi/README
+@@ -0,0 +1,16 @@
++This directory contains files that are required for the XenAPI support.
++They should be installed in the XenServer / Xen Cloud Platform dom0.
++
++If you install them manually, you will need to ensure that the newly
++added files are executable. You can do this by running the following
++command (from dom0):
++
++    chmod a+x /etc/xapi.d/plugins/*
++
++Otherwise, you can build an rpm by running the following command:
++
++    ./contrib/build-rpm.sh
++
++and install the rpm by running the following command (from dom0):
++
++    rpm -i openstack-quantum-xen-plugins.rpm
+diff --git a/quantum/plugins/openvswitch/agent/xenapi/contrib/build-rpm.sh b/quantum/plugins/openvswitch/agent/xenapi/contrib/build-rpm.sh
+new file mode 100755
+index 0000000..e2bca97
+--- /dev/null
++++ b/quantum/plugins/openvswitch/agent/xenapi/contrib/build-rpm.sh
+@@ -0,0 +1,34 @@
++#!/bin/bash
++
++set -eux
++
++thisdir=$(dirname $(readlink -f "$0"))
++export QUANTUM_ROOT="$thisdir/../../../../../../"
++export PYTHONPATH=$QUANTUM_ROOT
++
++cd $QUANTUM_ROOT
++VERSION=$(sh -c "(cat $QUANTUM_ROOT/quantum/version.py; \
++                  echo 'print common_version.VersionInfo(\"quantum\").release_string()') | \
++                  python")
++cd -
++
++PACKAGE=openstack-quantum-xen-plugins
++RPMBUILD_DIR=$PWD/rpmbuild
++if [ ! -d $RPMBUILD_DIR ]; then
++    echo $RPMBUILD_DIR is missing
++    exit 1
++fi
++
++for dir in BUILD BUILDROOT SRPMS RPMS SOURCES; do
++    rm -rf $RPMBUILD_DIR/$dir
++    mkdir -p $RPMBUILD_DIR/$dir
++done
++
++rm -rf /tmp/$PACKAGE
++mkdir /tmp/$PACKAGE
++cp -r ../etc/xapi.d /tmp/$PACKAGE
++tar czf $RPMBUILD_DIR/SOURCES/$PACKAGE.tar.gz -C /tmp $PACKAGE
++
++rpmbuild -ba --nodeps --define "_topdir $RPMBUILD_DIR"  \
++    --define "version $VERSION" \
++    $RPMBUILD_DIR/SPECS/$PACKAGE.spec
+diff --git a/quantum/plugins/openvswitch/agent/xenapi/contrib/rpmbuild/SPECS/openstack-quantum-xen-plugins.spec b/quantum/plugins/openvswitch/agent/xenapi/contrib/rpmbuild/SPECS/openstack-quantum-xen-plugins.spec
+new file mode 100644
+index 0000000..abca7b6
+--- /dev/null
++++ b/quantum/plugins/openvswitch/agent/xenapi/contrib/rpmbuild/SPECS/openstack-quantum-xen-plugins.spec
+@@ -0,0 +1,30 @@
++Name:           openstack-quantum-xen-plugins
++Version:        %{version}
++Release:        1
++Summary:        Files for XenAPI support.
++License:        ASL 2.0
++Group:          Applications/Utilities
++Source0:        openstack-quantum-xen-plugins.tar.gz
++BuildArch:      noarch
++BuildRoot:      %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
++
++%define debug_package %{nil}
++
++%description
++This package contains files that are required for XenAPI support for Quantum.
++
++%prep
++%setup -q -n openstack-quantum-xen-plugins
++
++%install
++rm -rf $RPM_BUILD_ROOT
++mkdir -p $RPM_BUILD_ROOT/etc
++cp -r xapi.d $RPM_BUILD_ROOT/etc
++chmod a+x $RPM_BUILD_ROOT/etc/xapi.d/plugins/*
++
++%clean
++rm -rf $RPM_BUILD_ROOT
++
++%files
++%defattr(-,root,root,-)
++/etc/xapi.d/plugins/*
+diff --git a/quantum/plugins/openvswitch/agent/xenapi/etc/xapi.d/plugins/netwrap b/quantum/plugins/openvswitch/agent/xenapi/etc/xapi.d/plugins/netwrap
+new file mode 100644
+index 0000000..57fcb9a
+--- /dev/null
++++ b/quantum/plugins/openvswitch/agent/xenapi/etc/xapi.d/plugins/netwrap
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python
++
++# Copyright 2012 OpenStack LLC.
++# Copyright 2012 United States Government as represented by the
++# Administrator of the National Aeronautics and Space Administration.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++#
++# XenAPI plugin for executing network commands (ovs, iptables, etc) on dom0
++#
++
++import gettext
++gettext.install('quantum', unicode=1)
++try:
++    import json
++except ImportError:
++    import simplejson as json
++import subprocess
++
++import XenAPIPlugin
++
++
++ALLOWED_CMDS = [
++    'ip',
++    'ovs-ofctl',
++    'ovs-vsctl',
++    ]
++
++
++class PluginError(Exception):
++    """Base Exception class for all plugin errors."""
++    def __init__(self, *args):
++        Exception.__init__(self, *args)
++
++
++def _run_command(cmd):
++    """Abstracts out the basics of issuing system commands. If the command
++    returns anything in stderr, a PluginError is raised with that information.
++    Otherwise, the output from stdout is returned.
++    """
++    pipe = subprocess.PIPE
++    proc = subprocess.Popen(cmd, shell=False, stdin=pipe, stdout=pipe,
++                            stderr=pipe, close_fds=True)
++    proc.wait()
++    err = proc.stderr.read()
++    if err:
++        raise PluginError(err)
++    return proc.stdout.read()
++
++
++def run_command(session, args):
++    cmd = json.loads(args.get('cmd'))
++    if cmd and cmd[0] not in ALLOWED_CMDS:
++        msg = _("Dom0 execution of '%s' is not permitted") % cmd[0]
++        raise PluginError(msg)
++    result = _run_command(cmd)
++    return json.dumps(result)
++
++
++if __name__ == "__main__":
++    XenAPIPlugin.dispatch({"run_command": run_command})
+diff --git a/quantum/plugins/openvswitch/agent/xenserver_install.sh b/quantum/plugins/openvswitch/agent/xenserver_install.sh
+deleted file mode 100755
+index 6c1efe9..0000000
+--- a/quantum/plugins/openvswitch/agent/xenserver_install.sh
++++ /dev/null
+@@ -1,40 +0,0 @@
+-#!/bin/bash
+-
+-CONF_FILE=/etc/xapi.d/plugins/ovs_quantum_plugin.ini
+-VERSION=$(python -c "import sys ; sys.path.append('../../../../quantum/') ; import version ; print version.canonical_version_string()")
+-
+-if [ ! -d /etc/xapi.d/plugins ]; then
+-    echo "Am I on a xenserver? I can't find the plugins directory!"
+-    exit 1
+-fi
+-
+-rpm -Uvh http://dl.fedoraproject.org/pub/epel/5/i386/epel-release-5-4.noarch.rpm
+-
+-if [ "$1" == "with_python_2.6" ] ; then
+-    yum --enablerepo=base -y install mx
+-    yum --enablerepo=epel -y install python26 python26-sqlalchemy python26-mysqldb
+-else
+-    yum --enablerepo=epel -y install python-sqlalchemy
+-    yum --enablerepo=base -y install MySQL-python
+-fi
+-
+-sed -i 's/enabled=1/enabled=0/' /etc/yum.repos.d/epel.repo
+-
+-rpm -Uvh $PWD/build/rpm/RPMS/noarch/ovs-quantum-agent-$VERSION-1.noarch.rpm
+-
+-xe network-list name-label="integration-bridge" | grep xapi >/dev/null 2>&1
+-if [ $? -ne 0 ]; then
+-    echo "No integration bridge found.  Creating."
+-    xe network-create name-label="integration-bridge"
+-fi
+-
+-BR=$(xe network-list name-label="integration-bridge" | grep "bridge.*:" | awk '{print $4}')
+-CONF_BR=$(grep integration-bridge ${CONF_FILE} | cut -d= -f2)
+-if [ "X$BR" != "X$CONF_BR" ]; then
+-    echo "Integration bridge doesn't match configuration file; fixing."
+-    sed -i -e "s/^integration-bridge =.*$/integration-bridge = ${BR}/g" $CONF_FILE
+-fi
+-
+-echo "Using integration bridge: $BR (make sure this is set in the nova configuration)"
+-
+-echo "Make sure to edit: $CONF_FILE"
+diff --git a/quantum/tests/unit/openvswitch/test_ovs_lib.py b/quantum/tests/unit/openvswitch/test_ovs_lib.py
+index 93bf514..1995c89 100644
+--- a/quantum/tests/unit/openvswitch/test_ovs_lib.py
++++ b/quantum/tests/unit/openvswitch/test_ovs_lib.py
+@@ -15,7 +15,9 @@
+ #    under the License.
+ # @author: Dan Wendlandt, Nicira, Inc.
+ 
++import mock
+ import mox
++import testtools
+ 
+ from quantum.agent.linux import ovs_lib, utils
+ from quantum.openstack.common import uuidutils
+@@ -344,3 +346,14 @@ class OVS_Lib_Test(base.BaseTestCase):
+         self.mox.ReplayAll()
+         self.assertEqual(ovs_lib.get_bridges(root_helper), bridges)
+         self.mox.VerifyAll()
++
++    def test_get_local_port_mac_succeeds(self):
++        with mock.patch('quantum.agent.linux.ip_lib.IpLinkCommand',
++                        return_value=mock.Mock(address='foo')):
++            self.assertEqual('foo', self.br.get_local_port_mac())
++
++    def test_get_local_port_mac_raises_exception_for_missing_mac(self):
++        with mock.patch('quantum.agent.linux.ip_lib.IpLinkCommand',
++                        return_value=mock.Mock(address=None)):
++            with testtools.ExpectedException(Exception):
++                self.br.get_local_port_mac()
+diff --git a/quantum/tests/unit/openvswitch/test_ovs_tunnel.py b/quantum/tests/unit/openvswitch/test_ovs_tunnel.py
+index 31d0ba4..4720053 100644
+--- a/quantum/tests/unit/openvswitch/test_ovs_tunnel.py
++++ b/quantum/tests/unit/openvswitch/test_ovs_tunnel.py
+@@ -21,7 +21,6 @@ from oslo.config import cfg
+ 
+ from quantum.agent.linux import ip_lib
+ from quantum.agent.linux import ovs_lib
+-from quantum.agent.linux import utils
+ from quantum.openstack.common import log
+ from quantum.plugins.openvswitch.agent import ovs_quantum_agent
+ from quantum.plugins.openvswitch.common import constants
+@@ -123,9 +122,7 @@ class TunnelTest(base.BaseTestCase):
+             'int-tunnel_bridge_mapping',
+             'phy-tunnel_bridge_mapping').AndReturn([self.inta, self.intb])
+ 
+-        self.mox.StubOutWithMock(utils, 'get_interface_mac')
+-        utils.get_interface_mac(self.INT_BRIDGE).AndReturn(
+-            '00:00:00:00:00:01')
++        self.mock_int_bridge.get_local_port_mac().AndReturn('000000000001')
+ 
+     def testConstruct(self):
+         self.mox.ReplayAll()
+-- 
+1.8.1.2
+

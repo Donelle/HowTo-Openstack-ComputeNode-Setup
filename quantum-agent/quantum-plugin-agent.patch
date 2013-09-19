@@ -1,0 +1,310 @@
+From 7ff0c53564f46bdd6f47cb1ed9e6d2460d088b1e Mon Sep 17 00:00:00 2001
+From: Maru Newby <mnewby@internap.com>
+Date: Thu, 25 Oct 2012 18:03:26 +0000
+Subject: [PATCH] Add support for OVS l2 agent in XS/XCP domU.
+
+ * Config doc: http://wiki.openstack.org/QuantumDevstackOvsXcp
+
+ * The Open vSwitch agent needs to be deployed on domU but
+   interact with a dom0 bridge.
+ * Add a root wrapper and associated XenAPI plugin to allow the
+   agent to execute networking commands against dom0 from domU.
+ * Update ovs_lib mac address discovery to use ip_lib to
+   ensure that discovery works even for bridges not local to
+   the agent (i.e. dom0 bridges).  A bridge configured with
+   a dom0 root wrapper will execute ip link on dom0.
+ * Update ip_lib to use a root helper by default to ensure that
+   the 'ip' command will execute on dom0.
+ * Remove obselete rpm spec and installer for dom0 agent.
+ * Credit where credit is due - the XenAPI plugin and its
+   packaging were largely copied from nova.
+ * Supports blueprint xenapi-ovs
+
+Change-Id: I7795446ee1267712c896f5cb3401f84fb1763ce7
+---
+ bin/quantum-rootwrap-xen-dom0                      | 119 +++++++++++++++++++++
+ etc/rootwrap.conf                                  |   7 ++
+ agent/linux/ip_lib.py                      |  18 ++++
+ agent/linux/ovs_lib.py                     |  10 ++
+ quantum/plugins/openvswitch/Makefile               |  54 ----------
+ .../agent/ovs-quantum-agent-xs_xcp.spec            |  33 ------
+ .../plugins/openvswitch/agent/ovs_quantum_agent.py |  14 ++-
+ quantum/plugins/openvswitch/agent/xenapi/README    |  16 +++
+ .../openvswitch/agent/xenapi/contrib/build-rpm.sh  |  34 ++++++
+ .../SPECS/openstack-quantum-xen-plugins.spec       |  30 ++++++
+ .../agent/xenapi/etc/xapi.d/plugins/netwrap        |  73 +++++++++++++
+ .../plugins/openvswitch/agent/xenserver_install.sh |  40 -------
+ quantum/tests/unit/openvswitch/test_ovs_lib.py     |  13 +++
+ quantum/tests/unit/openvswitch/test_ovs_tunnel.py  |   5 +-
+ 14 files changed, 331 insertions(+), 135 deletions(-)
+ create mode 100755 bin/quantum-rootwrap-xen-dom0
+
+diff --git a/bin/quantum-rootwrap-xen-dom0 b/bin/quantum-rootwrap-xen-dom0
+new file mode 100755
+index 0000000..f4e6d2f
+--- /dev/null
++++ b/bin/quantum-rootwrap-xen-dom0
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python
++
++# Copyright (c) 2012 Openstack, LLC.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""Quantum root wrapper for dom0.
++
++Executes networking commands in dom0.  The XenAPI plugin is
++responsible determining whether a command is safe to execute.
++
++"""
++
++import ConfigParser
++import json
++import os
++import sys
++import traceback
++
++import XenAPI
++
++
++RC_UNAUTHORIZED = 99
++RC_NOCOMMAND = 98
++RC_BADCONFIG = 97
++RC_XENAPI_ERROR = 96
++
++
++def parse_args():
++    # Split arguments, require at least a command
++    exec_name = sys.argv.pop(0)
++    # argv[0] required; path to conf file
++    if len(sys.argv) < 2:
++        print "%s: No command specified" % exec_name
++        sys.exit(RC_NOCOMMAND)
++
++    config_file = sys.argv.pop(0)
++    user_args = sys.argv[:]
++
++    return exec_name, config_file, user_args
++
++
++def load_configuration(exec_name, config_file):
++    config = ConfigParser.RawConfigParser()
++    config.read(config_file)
++    try:
++        filters_path = config.get("DEFAULT", "filters_path").split(",")
++        section = 'XENAPI'
++        url = config.get(section, "xenapi_connection_url")
++        username = config.get(section, "xenapi_connection_username")
++        password = config.get(section, "xenapi_connection_password")
++    except ConfigParser.Error:
++        print "%s: Incorrect configuration file: %s" % (exec_name, config_file)
++        sys.exit(RC_BADCONFIG)
++    if not url or not password:
++        msg = ("%s: Must specify xenapi_connection_url, "
++               "xenapi_connection_username (optionally), and "
++               "xenapi_connection_password in %s") % (exec_name, config_file)
++        print msg
++        sys.exit(RC_BADCONFIG)
++    return dict(
++        filters_path=filters_path,
++        url=url,
++        username=username,
++        password=password,
++    )
++
++
++def filter_command(exec_name, filters_path, user_args):
++    # Add ../ to sys.path to allow running from branch
++    possible_topdir = os.path.normpath(os.path.join(os.path.abspath(exec_name),
++                                                    os.pardir, os.pardir))
++    if os.path.exists(os.path.join(possible_topdir, "quantum", "__init__.py")):
++        sys.path.insert(0, possible_topdir)
++
++    from quantum.rootwrap import wrapper
++
++    # Execute command if it matches any of the loaded filters
++    filters = wrapper.load_filters(filters_path)
++    filter_match = wrapper.match_filter(filters, user_args)
++    if not filter_match:
++        print "Unauthorized command: %s" % ' '.join(user_args)
++        sys.exit(RC_UNAUTHORIZED)
++
++
++def run_command(url, username, password, user_args):
++    try:
++        session = XenAPI.Session(url)
++        session.login_with_password(username, password)
++        host = session.xenapi.session.get_this_host(session.handle)
++        result = session.xenapi.host.call_plugin(
++            host, 'netwrap', 'run_command', {'cmd': json.dumps(user_args)})
++        return json.loads(result)
++    except Exception as e:
++        traceback.print_exc()
++        sys.exit(RC_XENAPI_ERROR)
++
++
++def main():
++    exec_name, config_file, user_args = parse_args()
++    config = load_configuration(exec_name, config_file)
++    filter_command(exec_name, config['filters_path'], user_args)
++    return run_command(config['url'], config['username'], config['password'],
++                       user_args)
++
++
++if __name__ == '__main__':
++    print main()
+diff --git a/etc/rootwrap.conf b/etc/rootwrap.conf
+index 5f88a6a..cd472f5 100644
+--- a/etc/rootwrap.conf
++++ b/etc/rootwrap.conf
+@@ -2,3 +2,10 @@
+ # List of directories to load filter definitions from (separated by ',').
+ # These directories MUST all be only writeable by root !
+ filters_path=/etc/quantum/rootwrap.d,/usr/share/quantum/rootwrap
++
++[XENAPI]
++# XenAPI configuration is only required by the L2 agent if it is to
++# target a XenServer/XCP compute host's dom0.
++xenapi_connection_url=<None>
++xenapi_connection_username=root
++xenapi_connection_password=<None>
+diff --git a/agent/linux/ip_lib.py b/agent/linux/ip_lib.py
+index 0aba924..9de7df9 100644
+--- a/agent/linux/ip_lib.py
++++ b/agent/linux/ip_lib.py
+@@ -15,11 +15,19 @@
+ #    under the License.
+ 
+ import netaddr
++from oslo.config import cfg
+ 
+ from quantum.agent.linux import utils
+ from quantum.common import exceptions
+ 
+ 
++OPTS = [
++    cfg.BoolOpt('ip_lib_force_root',
++                default=False,
++                help=_('Force ip_lib calls to use the root helper')),
++]
++
++
+ LOOPBACK_DEVNAME = 'lo'
+ 
+ 
+@@ -27,10 +35,20 @@ class SubProcessBase(object):
+     def __init__(self, root_helper=None, namespace=None):
+         self.root_helper = root_helper
+         self.namespace = namespace
++        try:
++            self.force_root = cfg.CONF.ip_lib_force_root
++        except cfg.NoSuchOptError:
++            # Only callers that need to force use of the root helper
++            # need to register the option.
++            self.force_root = False
+ 
+     def _run(self, options, command, args):
+         if self.namespace:
+             return self._as_root(options, command, args)
++        elif self.force_root:
++            # Force use of the root helper to ensure that commands
++            # will execute in dom0 when running under XenServer/XCP.
++            return self._execute(options, command, args, self.root_helper)
+         else:
+             return self._execute(options, command, args)
+ 
+diff --git a/agent/linux/ovs_lib.py b/agent/linux/ovs_lib.py
+index f435a34..5e8cb94 100644
+--- a/agent/linux/ovs_lib.py
++++ b/agent/linux/ovs_lib.py
+@@ -20,6 +20,7 @@
+ 
+ import re
+ 
++from quantum.agent.linux import ip_lib
+ from quantum.agent.linux import utils
+ from quantum.openstack.common import log as logging
+ 
+@@ -283,6 +284,15 @@ class OVSBridge:
+         for port_name in port_names:
+             self.delete_port(port_name)
+ 
++    def get_local_port_mac(self):
++        """Retrieve the mac of the bridge's local port."""
++        address = ip_lib.IPDevice(self.br_name, self.root_helper).link.address
++        if address:
++            return address
++        else:
++            msg = _('Unable to determine mac address for %s') % self.br_name
++            raise Exception(msg)
++
+ 
+ def get_bridge_for_iface(root_helper, iface):
+     args = ["ovs-vsctl", "--timeout=2", "iface-to-br", iface]
+
+diff --git a/plugins/openvswitch/agent/ovs_quantum_agent.py b/plugins/openvswitch/agent/ovs_quantum_agent.py
+index 91dcda1..fca62a1 100644
+--- a/plugins/openvswitch/agent/ovs_quantum_agent.py
++++ b/plugins/openvswitch/agent/ovs_quantum_agent.py
+@@ -28,7 +28,6 @@ from oslo.config import cfg
+ 
+ from quantum.agent.linux import ip_lib
+ from quantum.agent.linux import ovs_lib
+-from quantum.agent.linux import utils
+ from quantum.agent import rpc as agent_rpc
+ from quantum.agent import securitygroups_rpc as sg_rpc
+ from quantum.common import config as logging_config
+@@ -185,7 +184,7 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
+             'configurations': bridge_mappings,
+             'agent_type': q_const.AGENT_TYPE_OVS,
+             'start_flag': True}
+-        self.setup_rpc(integ_br)
++        self.setup_rpc()
+ 
+         # Security group agent supprot
+         self.sg_agent = OVSSecurityGroupAgent(self.context,
+@@ -204,8 +203,8 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
+         except Exception:
+             LOG.exception(_("Failed reporting state!"))
+ 
+-    def setup_rpc(self, integ_br):
+-        mac = utils.get_interface_mac(integ_br)
++    def setup_rpc(self):
++        mac = self.int_br.get_local_port_mac()
+         self.agent_id = '%s%s' % ('ovs', (mac.replace(":", "")))
+         self.topic = topics.AGENT
+         self.plugin_rpc = OVSPluginApi(topics.PLUGIN)
+@@ -762,6 +761,7 @@ def create_agent_config_map(config):
+ def main():
+     eventlet.monkey_patch()
+     cfg.CONF(project='quantum')
++    cfg.CONF.register_opts(ip_lib.OPTS)
+     logging_config.setup_logging(cfg.CONF)
+ 
+     try:
+@@ -770,6 +770,12 @@ def main():
+         LOG.error(_('%s Agent terminated!'), e)
+         sys.exit(1)
+ 
++    is_xen_compute_host = 'rootwrap-xen-dom0' in agent_config['root_helper']
++    if is_xen_compute_host:
++        # Force ip_lib to always use the root helper to ensure that ip
++        # commands target xen dom0 rather than domU.
++        cfg.CONF.set_default('ip_lib_force_root', True)
++
+     plugin = OVSQuantumAgent(**agent_config)
+ 
+     # Start everything.
+1.8.1.2
+
