@@ -69,7 +69,7 @@ The following set of instructions assumes that the server:
 
 1. Press **alt+F3**, which should bring you to the terminal console, then **login as root**
 2. Download the plugins package from the **quantum-agent** folder in this repo and install the package *(a little __wget__ magic should do the trick)*
-    * $ rpm -i openstack-quantum-xen-plugins.noarch.rpm
+    * $ rpm -i [quantum-xen-plugins.noarch.rpm](https://github.com/Donelle/HowTo-Openstack-ComputeNode-Setup/blob/master/quantum-agent/quantum-xen-plugins.noarch.rpm)
 
 
 ### Create an ISO Storage Repository (Optional)
